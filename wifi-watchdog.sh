@@ -51,6 +51,8 @@ COOLDOWN_LONG=30
 
 # Logging
 LOG_TAG="wifi-watchdog"
+DEVICE_ID="${DEVICE_ID:-$(hostname -s 2>/dev/null || echo unknown-device)}"
+MQTT_TOPIC_META="${MQTT_TOPIC_META:-fleet/services/${DEVICE_ID}/meta}"
 
 # ---------------------------------------------------------------------------
 # State
@@ -94,8 +96,8 @@ mqtt_report() {
     local event="$1"
     local message="$2"
     if command -v fleet-publish &>/dev/null; then
-        fleet-publish --json "{\"service\":\"wifi-watchdog\",\"event\":\"${event}\",\"message\":\"${message}\",\"mode\":\"${MODE}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS},\"wifi_interface\":\"${WIFI_INTERFACE}\",\"wired_interface\":\"${WIRED_INTERFACE}\"}" \
-            --topic "fleet/wifi-watchdog" 2>/dev/null || true
+        fleet-publish --json "{\"event\":\"${event}\",\"service\":\"wifi-watchdog\",\"device_id\":\"${DEVICE_ID}\",\"timestamp\":$(date +%s),\"message\":\"${message}\",\"mode\":\"${MODE}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS},\"wifi_interface\":\"${WIFI_INTERFACE}\",\"wired_interface\":\"${WIRED_INTERFACE}\"}" \
+            --topic "${MQTT_TOPIC_META}" --no-encrypt 2>/dev/null || true
     fi
 }
 
@@ -442,9 +444,23 @@ maybe_report_status() {
         log_info "Status: mode=${MODE} wifi_ssid=${wifi_ssid} wifi_ip=${wifi_ip} wifi_signal=${wifi_signal} wired_ip=${wired_ip} wired_carrier=${wired_carrier} uptime=${uptime_sec}s reconnects=${TOTAL_RECONNECTS} failures=${CONSECUTIVE_WIFI_FAILURES}"
 
         if command -v fleet-publish &>/dev/null; then
+            local healthy_json unhealthy_json
+            if [ "${MODE}" = "wired_ok" ] || check_wifi_connectivity; then
+                healthy_json='["wifi-watchdog","connectivity"]'
+                unhealthy_json='[]'
+            else
+                healthy_json='["wifi-watchdog"]'
+                unhealthy_json='["connectivity"]'
+            fi
+
             fleet-publish --json "{
-                \"service\": \"wifi-watchdog\",
                 \"event\": \"status\",
+                \"service\": \"wifi-watchdog\",
+                \"device_id\": \"${DEVICE_ID}\",
+                \"timestamp\": $(date +%s),
+                \"managed\": [\"wifi-watchdog\", \"connectivity\"],
+                \"healthy\": ${healthy_json},
+                \"unhealthy\": ${unhealthy_json},
                 \"mode\": \"${MODE}\",
                 \"wifi\": {
                     \"interface\": \"${WIFI_INTERFACE}\",
@@ -460,7 +476,7 @@ maybe_report_status() {
                 \"uptime_sec\": ${uptime_sec},
                 \"total_reconnects\": ${TOTAL_RECONNECTS},
                 \"consecutive_failures\": ${CONSECUTIVE_WIFI_FAILURES}
-            }" --topic "fleet/wifi-watchdog" 2>/dev/null || true
+            }" --topic "${MQTT_TOPIC_META}" --no-encrypt 2>/dev/null || true
         fi
     fi
 }
