@@ -1,0 +1,27 @@
+[Unit]
+Description=WiFi Watchdog - automatic network reconnection service
+After=sys-subsystem-net-devices-wlan0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+# Never stop trying to restart this service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=~/Desktop/3-SYSTEM/wifi-watchdog/wifi-watchdog.sh
+WorkingDirectory=~/Desktop/3-SYSTEM/wifi-watchdog
+Restart=always
+RestartSec=3
+User=root
+
+# Never give up restarting
+StartLimitBurst=0
+
+# Watchdog: systemd will kill and restart us if we stop responding
+WatchdogSec=120
+
+# Environment
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

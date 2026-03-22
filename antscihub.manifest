@@ -1,0 +1,7 @@
+# WiFi Watchdog - keeps network alive at all costs
+# Smart about wired vs wireless - only aggressive when needed
+SERVICE_NAME=wifi-watchdog.service
+GIT_REMOTE=https://github.com/soulsynapse/antscihub-pi-wifi-watchdog.git
+INSTALL_CMD=sudo bash install.sh
+STARTUP_GRACE=5
+GIT_BRANCH=main
