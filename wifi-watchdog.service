@@ -14,7 +14,7 @@ RestartSec=3
 User=root
 
 StartLimitBurst=0
-WatchdogSec=120
+WatchdogSec=300
 
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
