@@ -16,4 +16,4 @@ This module is intended to live at:
 
 This module is listed as part of:
 
-- https://github.com/soulsynapse/antscihub-pi-managed-services
+- https://github.com/soulsynapse/antscihub-pi-service-manager
