@@ -1,6 +1,6 @@
 # WiFi Watchdog Module
 
-This repository contains the `wifi-watchdog` module for AntsciHub Raspberry Pi deployments.
+This repository contains the `wifi-watchdog` module for AntSciHub Raspberry Pi deployments.
 
 Canonical repository:
 
