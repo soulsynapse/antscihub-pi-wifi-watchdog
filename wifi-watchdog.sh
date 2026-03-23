@@ -96,8 +96,10 @@ mqtt_report() {
     local event="$1"
     local message="$2"
     if command -v fleet-publish &>/dev/null; then
-        fleet-publish --json "{\"event\":\"${event}\",\"service\":\"wifi-watchdog\",\"device_id\":\"${DEVICE_ID}\",\"timestamp\":$(date +%s),\"message\":\"${message}\",\"mode\":\"${MODE}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS},\"wifi_interface\":\"${WIFI_INTERFACE}\",\"wired_interface\":\"${WIRED_INTERFACE}\"}" \
-            --topic "${MQTT_TOPIC_META}" --no-encrypt 2>/dev/null || true
+        fleet-publish \
+            --topic "fleet/response/${DEVICE_ID}" \
+            --json "{\"schema\":\"fleet.service-manager.v1\",\"event\":\"${event}\",\"service\":\"wifi-watchdog\",\"device_id\":\"${DEVICE_ID}\",\"timestamp\":$(date +%s),\"message\":\"${message}\",\"mode\":\"${MODE}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS}}" \
+            2>/dev/null || true
     fi
 }
 
@@ -430,55 +432,38 @@ ensure_wifi_up() {
 maybe_report_status() {
     local now
     now=$(date +%s)
-    if (( now - LAST_STATUS_REPORT >= STATUS_REPORT_INTERVAL )); then
-        LAST_STATUS_REPORT=$now
-
-        local wifi_ssid wifi_ip wifi_signal wired_ip wired_carrier uptime_sec
-        wifi_ssid=$(iwgetid "${WIFI_INTERFACE}" -r 2>/dev/null || echo "none")
-        wifi_ip=$(ip -4 addr show "${WIFI_INTERFACE}" 2>/dev/null | awk '/inet / {print $2}' | head -1 || echo "none")
-        wifi_signal=$(iwconfig "${WIFI_INTERFACE}" 2>/dev/null | grep -o 'Signal level=[^ ]*' | cut -d= -f2 || echo "unknown")
-        wired_ip=$(ip -4 addr show "${WIRED_INTERFACE}" 2>/dev/null | awk '/inet / {print $2}' | head -1 || echo "none")
-        wired_carrier=$(cat "/sys/class/net/${WIRED_INTERFACE}/carrier" 2>/dev/null || echo "0")
-        uptime_sec=$(( now - STARTUP_TIME ))
-
-        log_info "Status: mode=${MODE} wifi_ssid=${wifi_ssid} wifi_ip=${wifi_ip} wifi_signal=${wifi_signal} wired_ip=${wired_ip} wired_carrier=${wired_carrier} uptime=${uptime_sec}s reconnects=${TOTAL_RECONNECTS} failures=${CONSECUTIVE_WIFI_FAILURES}"
-
-        if command -v fleet-publish &>/dev/null; then
-            local healthy_json unhealthy_json
-            if [ "${MODE}" = "wired_ok" ] || check_wifi_connectivity; then
-                healthy_json='["wifi-watchdog","connectivity"]'
-                unhealthy_json='[]'
-            else
-                healthy_json='["wifi-watchdog"]'
-                unhealthy_json='["connectivity"]'
-            fi
-
-            fleet-publish --json "{
-                \"event\": \"status\",
-                \"service\": \"wifi-watchdog\",
-                \"device_id\": \"${DEVICE_ID}\",
-                \"timestamp\": $(date +%s),
-                \"managed\": [\"wifi-watchdog\", \"connectivity\"],
-                \"healthy\": ${healthy_json},
-                \"unhealthy\": ${unhealthy_json},
-                \"mode\": \"${MODE}\",
-                \"wifi\": {
-                    \"interface\": \"${WIFI_INTERFACE}\",
-                    \"ssid\": \"${wifi_ssid}\",
-                    \"ip\": \"${wifi_ip}\",
-                    \"signal\": \"${wifi_signal}\"
-                },
-                \"wired\": {
-                    \"interface\": \"${WIRED_INTERFACE}\",
-                    \"ip\": \"${wired_ip}\",
-                    \"carrier\": \"${wired_carrier}\"
-                },
-                \"uptime_sec\": ${uptime_sec},
-                \"total_reconnects\": ${TOTAL_RECONNECTS},
-                \"consecutive_failures\": ${CONSECUTIVE_WIFI_FAILURES}
-            }" --topic "${MQTT_TOPIC_META}" --no-encrypt 2>/dev/null || true
-        fi
+    if (( now - LAST_STATUS_REPORT < STATUS_REPORT_INTERVAL )); then
+        return
     fi
+    LAST_STATUS_REPORT=$now
+
+    local wifi_ssid wifi_ip wifi_signal wired_ip wired_carrier uptime_sec
+    wifi_ssid=$(iwgetid "${WIFI_INTERFACE}" -r 2>/dev/null || echo "none")
+    wifi_ip=$(ip -4 addr show "${WIFI_INTERFACE}" 2>/dev/null | awk '/inet / {print $2}' | head -1 || echo "none")
+    wifi_signal=$(iwconfig "${WIFI_INTERFACE}" 2>/dev/null | grep -o 'Signal level=[^ ]*' | cut -d= -f2 || echo "unknown")
+    wired_ip=$(ip -4 addr show "${WIRED_INTERFACE}" 2>/dev/null | awk '/inet / {print $2}' | head -1 || echo "none")
+    wired_carrier=$(cat "/sys/class/net/${WIRED_INTERFACE}/carrier" 2>/dev/null || echo "0")
+    uptime_sec=$(( now - STARTUP_TIME ))
+
+    log_info "Status: mode=${MODE} wifi=${wifi_ssid} signal=${wifi_signal} wired=${wired_carrier} uptime=${uptime_sec}s reconnects=${TOTAL_RECONNECTS}"
+
+    if ! command -v fleet-publish &>/dev/null; then
+        return
+    fi
+
+    local healthy_json unhealthy_json
+    if [ "${MODE}" = "wired_ok" ] || check_wifi_connectivity; then
+        healthy_json='["wifi-watchdog","connectivity"]'
+        unhealthy_json='[]'
+    else
+        healthy_json='["wifi-watchdog"]'
+        unhealthy_json='["connectivity"]'
+    fi
+
+    fleet-publish \
+        --topic "fleet/response/${DEVICE_ID}" \
+        --json "{\"schema\":\"fleet.service-manager.v1\",\"event\":\"status\",\"service\":\"wifi-watchdog\",\"device_id\":\"${DEVICE_ID}\",\"timestamp\":$(date +%s),\"managed\":[\"wifi-watchdog\",\"connectivity\"],\"healthy\":${healthy_json},\"unhealthy\":${unhealthy_json},\"mode\":\"${MODE}\",\"wifi\":{\"interface\":\"${WIFI_INTERFACE}\",\"ssid\":\"${wifi_ssid}\",\"ip\":\"${wifi_ip}\",\"signal\":\"${wifi_signal}\"},\"wired\":{\"interface\":\"${WIRED_INTERFACE}\",\"ip\":\"${wired_ip}\",\"carrier\":\"${wired_carrier}\"},\"uptime_sec\":${uptime_sec},\"total_reconnects\":${TOTAL_RECONNECTS},\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES}}" \
+        2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
