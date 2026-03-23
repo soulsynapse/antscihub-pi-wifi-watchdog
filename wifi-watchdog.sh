@@ -42,7 +42,6 @@ IFUPDOWN_AFTER=3
 RFKILL_AFTER=5
 RESTART_SERVICES_AFTER=7
 FULL_RESET_AFTER=10
-REBOOT_AFTER=20
 
 # Cooldowns after escalation actions
 COOLDOWN_SHORT=10
@@ -238,7 +237,7 @@ update_wired_state() {
 # ---------------------------------------------------------------------------
 
 do_reassociate() {
-    log_info "Escalation 1/${REBOOT_AFTER}: wpa_cli reassociate"
+    log_info "Escalation 1/${FULL_RESET_AFTER}: wpa_cli reassociate"
     mqtt_report "reassociate" "Attempting wpa_cli reassociate"
 
     wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
@@ -248,7 +247,7 @@ do_reassociate() {
 }
 
 do_ifupdown() {
-    log_info "Escalation 2/${REBOOT_AFTER}: Bouncing interface ${WIFI_INTERFACE}"
+    log_info "Escalation 2/${FULL_RESET_AFTER}: Bouncing interface ${WIFI_INTERFACE}"
     mqtt_report "ifupdown" "Bouncing WiFi interface"
 
     if command -v ifdown &>/dev/null; then
@@ -266,7 +265,7 @@ do_ifupdown() {
 }
 
 do_rfkill_cycle() {
-    log_info "Escalation 3/${REBOOT_AFTER}: rfkill power-cycle"
+    log_info "Escalation 3/${FULL_RESET_AFTER}: rfkill power-cycle"
     mqtt_report "rfkill" "Power-cycling WiFi radio"
 
     if command -v rfkill &>/dev/null; then
@@ -284,7 +283,7 @@ do_rfkill_cycle() {
 }
 
 do_restart_services() {
-    log_info "Escalation 4/${REBOOT_AFTER}: Restarting networking services"
+    log_info "Escalation 4/${FULL_RESET_AFTER}: Restarting networking services"
     mqtt_report "restart_services" "Restarting wpa_supplicant, dhcpcd, networking"
 
     systemctl restart wpa_supplicant 2>/dev/null || true
@@ -305,7 +304,7 @@ do_restart_services() {
 }
 
 do_full_reset() {
-    log_info "Escalation 5/${REBOOT_AFTER}: Full interface reset"
+    log_info "Escalation 5/${FULL_RESET_AFTER}: Full interface reset"
     mqtt_report "full_reset" "Full WiFi interface teardown and rebuild"
 
     ip addr flush dev "${WIFI_INTERFACE}" 2>/dev/null || true
@@ -318,14 +317,6 @@ do_full_reset() {
     sleep 5
     request_dhcp
     sleep "${COOLDOWN_LONG}"
-}
-
-do_reboot() {
-    log_error "Escalation 6/${REBOOT_AFTER}: REBOOTING after ${CONSECUTIVE_WIFI_FAILURES} consecutive WiFi failures (no wired fallback)"
-    mqtt_report "reboot" "Rebooting Pi — no connectivity for too long"
-    sleep 3
-    sync
-    reboot
 }
 
 request_dhcp() {
@@ -345,17 +336,18 @@ escalate_wifi() {
     CONSECUTIVE_WIFI_FAILURES=$((CONSECUTIVE_WIFI_FAILURES + 1))
     log_warn "WiFi check failed (consecutive: ${CONSECUTIVE_WIFI_FAILURES}, mode: ${MODE})"
 
-    if [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${REBOOT_AFTER}" ]; then
-        do_reboot
-    elif [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${FULL_RESET_AFTER}" ]; then
+    # Pick escalation level, cycling back after full_reset
+    local level=$(( (CONSECUTIVE_WIFI_FAILURES - 1) % FULL_RESET_AFTER + 1 ))
+
+    if [ "$level" -ge "${FULL_RESET_AFTER}" ]; then
         do_full_reset
-    elif [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${RESTART_SERVICES_AFTER}" ]; then
+    elif [ "$level" -ge "${RESTART_SERVICES_AFTER}" ]; then
         do_restart_services
-    elif [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${RFKILL_AFTER}" ]; then
+    elif [ "$level" -ge "${RFKILL_AFTER}" ]; then
         do_rfkill_cycle
-    elif [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${IFUPDOWN_AFTER}" ]; then
+    elif [ "$level" -ge "${IFUPDOWN_AFTER}" ]; then
         do_ifupdown
-    elif [ "${CONSECUTIVE_WIFI_FAILURES}" -ge "${REASSOCIATE_AFTER}" ];     then
+    elif [ "$level" -ge "${REASSOCIATE_AFTER}" ]; then
         do_reassociate
     fi
 }
@@ -449,7 +441,7 @@ log_info "WiFi interface: ${WIFI_INTERFACE}"
 log_info "Wired interface: ${WIRED_INTERFACE}"
 log_info "========================================="
 log_info "Check intervals: wifi_primary=${CHECK_INTERVAL_WIFI_PRIMARY}s, wired_ok=${CHECK_INTERVAL_WIRED_OK}s, wired_dropped=${CHECK_INTERVAL_WIRED_JUST_DROPPED}s"
-log_info "Escalation: reassociate@${REASSOCIATE_AFTER}, ifupdown@${IFUPDOWN_AFTER}, rfkill@${RFKILL_AFTER}, restart@${RESTART_SERVICES_AFTER}, full_reset@${FULL_RESET_AFTER}, reboot@${REBOOT_AFTER}"
+log_info "Escalation: reassociate@${REASSOCIATE_AFTER}, ifupdown@${IFUPDOWN_AFTER}, rfkill@${RFKILL_AFTER}, restart@${RESTART_SERVICES_AFTER}, full_reset@${FULL_RESET_AFTER} (cycles)"
 mqtt_report "started" "WiFi watchdog started (wired-aware mode)"
 
 # Give the system a moment to bring up networking on boot
