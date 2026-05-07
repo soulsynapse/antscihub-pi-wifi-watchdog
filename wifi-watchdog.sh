@@ -10,7 +10,7 @@
 #   - If wired was never present → treat WiFi as primary, always aggressive.
 #
 # Escalation ladder (WiFi recovery):
-#   1. wpa_cli reassociate
+#   1. nmcli reconnect (fallback: wpa_cli reassociate)
 #   2. ifdown/ifup wlan0
 #   3. rfkill power-cycle
 #   4. Restart networking services
@@ -25,6 +25,7 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 WIFI_INTERFACE="${WIFI_INTERFACE:-wlan0}"
 WIRED_INTERFACE="${WIRED_INTERFACE:-eth0}"
+WIFI_CONNECTION_NAME="${WIFI_CONNECTION_NAME:-}"
 
 # Check intervals
 CHECK_INTERVAL_WIFI_PRIMARY=15    # WiFi is our only link — check aggressively
@@ -103,6 +104,44 @@ notify_watchdog() {
     if [ -n "${WATCHDOG_USEC:-}" ]; then
         systemd-notify WATCHDOG=1 2>/dev/null || true
     fi
+}
+
+networkmanager_running() {
+    command -v nmcli &>/dev/null || return 1
+    nmcli -t -f RUNNING general 2>/dev/null | grep -qx "running"
+}
+
+get_nm_wifi_connection_name() {
+    if [ -n "${WIFI_CONNECTION_NAME}" ]; then
+        echo "${WIFI_CONNECTION_NAME}"
+        return 0
+    fi
+
+    local active_connection
+    active_connection=$(nmcli -g GENERAL.CONNECTION device show "${WIFI_INTERFACE}" 2>/dev/null | head -1 || true)
+    if [ -n "${active_connection}" ] && [ "${active_connection}" != "--" ]; then
+        echo "${active_connection}"
+        return 0
+    fi
+
+    return 1
+}
+
+try_nmcli_reconnect() {
+    networkmanager_running || return 1
+
+    nmcli radio wifi on &>/dev/null || true
+    nmcli device set "${WIFI_INTERFACE}" managed yes &>/dev/null || true
+    nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
+
+    local connection_name
+    connection_name=$(get_nm_wifi_connection_name || true)
+    if [ -n "${connection_name}" ]; then
+        nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
+        nmcli connection up id "${connection_name}" ifname "${WIFI_INTERFACE}" &>/dev/null && return 0
+    fi
+
+    nmcli device connect "${WIFI_INTERFACE}" &>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -237,11 +276,16 @@ update_wired_state() {
 # ---------------------------------------------------------------------------
 
 do_reassociate() {
-    log_info "Escalation 1/${FULL_RESET_AFTER}: wpa_cli reassociate"
-    mqtt_report "reassociate" "Attempting wpa_cli reassociate"
+    if try_nmcli_reconnect; then
+        log_info "Escalation 1/${FULL_RESET_AFTER}: nmcli reconnect"
+        mqtt_report "reassociate" "Attempting NetworkManager reconnect"
+    else
+        log_info "Escalation 1/${FULL_RESET_AFTER}: wpa_cli reassociate"
+        mqtt_report "reassociate" "Attempting wpa_cli reassociate"
 
-    wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
-    wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+        wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+    fi
 
     sleep "${COOLDOWN_SHORT}"
 }
@@ -250,7 +294,9 @@ do_ifupdown() {
     log_info "Escalation 2/${FULL_RESET_AFTER}: Bouncing interface ${WIFI_INTERFACE}"
     mqtt_report "ifupdown" "Bouncing WiFi interface"
 
-    if command -v ifdown &>/dev/null; then
+    if try_nmcli_reconnect; then
+        :
+    elif command -v ifdown &>/dev/null; then
         ifdown "${WIFI_INTERFACE}" 2>/dev/null || true
         sleep 2
         ifup "${WIFI_INTERFACE}" 2>/dev/null || true
@@ -268,7 +314,13 @@ do_rfkill_cycle() {
     log_info "Escalation 3/${FULL_RESET_AFTER}: rfkill power-cycle"
     mqtt_report "rfkill" "Power-cycling WiFi radio"
 
-    if command -v rfkill &>/dev/null; then
+    if networkmanager_running; then
+        nmcli radio wifi off &>/dev/null || true
+        sleep 3
+        nmcli radio wifi on &>/dev/null || true
+        sleep 5
+        try_nmcli_reconnect || true
+    elif command -v rfkill &>/dev/null; then
         rfkill block wifi 2>/dev/null || true
         sleep 3
         rfkill unblock wifi 2>/dev/null || true
@@ -284,22 +336,25 @@ do_rfkill_cycle() {
 
 do_restart_services() {
     log_info "Escalation 4/${FULL_RESET_AFTER}: Restarting networking services"
-    mqtt_report "restart_services" "Restarting wpa_supplicant, dhcpcd, networking"
-
-    systemctl restart wpa_supplicant 2>/dev/null || true
-    sleep 3
-
-    if systemctl list-units --type=service --all 2>/dev/null | grep -q dhcpcd; then
-        systemctl restart dhcpcd 2>/dev/null || true
-        sleep 5
-    fi
-
-    if systemctl list-units --type=service --all 2>/dev/null | grep -q NetworkManager; then
+    if networkmanager_running; then
+        mqtt_report "restart_services" "Restarting NetworkManager"
         systemctl restart NetworkManager 2>/dev/null || true
         sleep 5
+        try_nmcli_reconnect || true
+    else
+        mqtt_report "restart_services" "Restarting wpa_supplicant, dhcpcd, networking"
+
+        systemctl restart wpa_supplicant 2>/dev/null || true
+        sleep 3
+
+        if systemctl list-units --type=service --all 2>/dev/null | grep -q dhcpcd; then
+            systemctl restart dhcpcd 2>/dev/null || true
+            sleep 5
+        fi
+
+        systemctl restart networking 2>/dev/null || true
     fi
 
-    systemctl restart networking 2>/dev/null || true
     sleep "${COOLDOWN_LONG}"
 }
 
@@ -313,13 +368,19 @@ do_full_reset() {
     sleep 3
     ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
     sleep 5
-    wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+    if ! try_nmcli_reconnect; then
+        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+    fi
     sleep 5
     request_dhcp
     sleep "${COOLDOWN_LONG}"
 }
 
 request_dhcp() {
+    if networkmanager_running; then
+        return 0
+    fi
+
     if command -v dhclient &>/dev/null; then
         dhclient -r "${WIFI_INTERFACE}" 2>/dev/null || true
         dhclient "${WIFI_INTERFACE}" 2>/dev/null || true
@@ -392,8 +453,10 @@ ensure_wifi_up() {
     fi
 
     # Ask wpa_supplicant to connect
-    wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
-    wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+    if ! try_nmcli_reconnect; then
+        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+        wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+    fi
 
     # Wait for association
     sleep 10
