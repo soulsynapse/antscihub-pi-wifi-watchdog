@@ -13,9 +13,7 @@
 #   1. nmcli reconnect (fallback: wpa_cli reassociate)
 #   2. ifdown/ifup wlan0
 #   3. rfkill power-cycle
-#   4. Restart networking services
-#   5. Full interface reset
-#   6. Reboot (nuclear)
+#   4. Full interface reset
 # ============================================================================
 
 set -uo pipefail
@@ -27,6 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WIFI_INTERFACE="${WIFI_INTERFACE:-wlan0}"
 WIRED_INTERFACE="${WIRED_INTERFACE:-eth0}"
 WIFI_CONNECTION_NAME="${WIFI_CONNECTION_NAME:-}"
+ALWAYS_RECORDING_MODE="true"
 
 # Optional non-ICMP probes (disabled unless configured)
 CONNECTIVITY_HTTP_URL="${CONNECTIVITY_HTTP_URL:-}"
@@ -34,6 +33,20 @@ CONNECTIVITY_TCP_HOST="${CONNECTIVITY_TCP_HOST:-}"
 CONNECTIVITY_TCP_PORT="${CONNECTIVITY_TCP_PORT:-443}"
 HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-6}"
 TCP_PROBE_TIMEOUT="${TCP_PROBE_TIMEOUT:-5}"
+
+# Recovery pacing / anti-thrash controls
+RECOVERY_ACTION_MIN_INTERVAL="${RECOVERY_ACTION_MIN_INTERVAL:-45}"
+FULL_RESET_MIN_INTERVAL="${FULL_RESET_MIN_INTERVAL:-180}"
+MAX_DISRUPTIVE_ACTIONS_PER_HOUR="${MAX_DISRUPTIVE_ACTIONS_PER_HOUR:-12}"
+THRASH_PAUSE_SECONDS="${THRASH_PAUSE_SECONDS:-300}"
+
+# Watchdog-safe pacing / command bounding
+WATCHDOG_HEARTBEAT_SLICE="${WATCHDOG_HEARTBEAT_SLICE:-10}"
+COMMAND_TIMEOUT_DEFAULT="${COMMAND_TIMEOUT_DEFAULT:-25}"
+COMMAND_TIMEOUT_PING="${COMMAND_TIMEOUT_PING:-15}"
+COMMAND_TIMEOUT_DHCP="${COMMAND_TIMEOUT_DHCP:-30}"
+COMMAND_TIMEOUT_NMCLI="${COMMAND_TIMEOUT_NMCLI:-20}"
+COMMAND_TIMEOUT_WPA_CLI="${COMMAND_TIMEOUT_WPA_CLI:-15}"
 
 # Check intervals
 CHECK_INTERVAL_WIFI_PRIMARY=15    # WiFi is our only link — check aggressively
@@ -49,7 +62,6 @@ PING_COUNT=2
 REASSOCIATE_AFTER=1
 IFUPDOWN_AFTER=3
 RFKILL_AFTER=5
-RESTART_SERVICES_AFTER=7
 FULL_RESET_AFTER=10
 
 # Cooldowns after escalation actions
@@ -78,6 +90,11 @@ LAST_FAILURE_REASON="none"
 LAST_FAILURE_TIME=0
 LAST_RECOVERY_TIME=0
 LAST_STATE_SYNC_TIME=0
+LAST_DISRUPTIVE_ACTION_TIME=0
+LAST_FULL_RESET_TIME=0
+DISRUPTIVE_WINDOW_START=0
+DISRUPTIVE_ACTION_COUNT=0
+THRASH_PAUSE_UNTIL=0
 
 # Track wired state transitions
 WIRED_WAS_UP=false
@@ -124,6 +141,85 @@ notify_watchdog() {
     fi
 }
 
+run_with_timeout() {
+    local timeout_seconds="$1"
+    local started_at
+    local cmd_pid
+    shift || return 1
+
+    if [ "$#" -eq 0 ]; then
+        return 1
+    fi
+
+    if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || [ "${timeout_seconds}" -le 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    if command_exists timeout; then
+        timeout "${timeout_seconds}" "$@"
+        return $?
+    fi
+
+    "$@" &
+    cmd_pid=$!
+    started_at=$(date +%s)
+
+    while kill -0 "${cmd_pid}" 2>/dev/null; do
+        if [ $(( $(date +%s) - started_at )) -ge "${timeout_seconds}" ]; then
+            kill "${cmd_pid}" 2>/dev/null || true
+            sleep 1
+            kill -9 "${cmd_pid}" 2>/dev/null || true
+            wait "${cmd_pid}" 2>/dev/null || true
+            logger -t "${LOG_TAG}" -p daemon.warning "Timed out command after ${timeout_seconds}s: $*" 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: Timed out command after ${timeout_seconds}s: $*" >&2
+            return 124
+        fi
+        notify_watchdog
+        sleep 1
+    done
+
+    wait "${cmd_pid}"
+    return $?
+}
+
+sleep_with_watchdog() {
+    local total_seconds="${1:-0}"
+    local heartbeat_slice="${WATCHDOG_HEARTBEAT_SLICE}"
+    local remaining
+    local step
+
+    if ! [[ "${total_seconds}" =~ ^[0-9]+$ ]] || [ "${total_seconds}" -lt 0 ]; then
+        notify_watchdog
+        sleep "${total_seconds}"
+        notify_watchdog
+        return 0
+    fi
+
+    if ! [[ "${heartbeat_slice}" =~ ^[0-9]+$ ]] || [ "${heartbeat_slice}" -lt 1 ]; then
+        heartbeat_slice=10
+    fi
+
+    remaining="${total_seconds}"
+    if [ "${remaining}" -eq 0 ]; then
+        notify_watchdog
+        return 0
+    fi
+
+    while [ "${remaining}" -gt 0 ]; do
+        notify_watchdog
+        if [ "${remaining}" -lt "${heartbeat_slice}" ]; then
+            step="${remaining}"
+        else
+            step="${heartbeat_slice}"
+        fi
+        sleep "${step}"
+        remaining=$((remaining - step))
+    done
+
+    notify_watchdog
+}
+
 command_exists() {
     command -v "$1" &>/dev/null
 }
@@ -137,6 +233,76 @@ mark_failure() {
     LAST_FAILURE_TIME=$(date +%s)
 }
 
+enforce_wifi_powersave_off() {
+    if command_exists iw; then
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" set power_save off &>/dev/null || true
+    fi
+
+    if networkmanager_running; then
+        local nm_powersave_conf
+        nm_powersave_conf="/etc/NetworkManager/conf.d/10-wifi-powersave-off.conf"
+        if [ -d "/etc/NetworkManager/conf.d" ]; then
+            cat > "${nm_powersave_conf}" <<EOF
+[connection]
+wifi.powersave=2
+EOF
+        fi
+
+        local connection_name
+        connection_name=$(get_nm_wifi_connection_name || true)
+        if [ -n "${connection_name}" ]; then
+            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.powersave 2 &>/dev/null || true
+            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
+            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device reapply "${WIFI_INTERFACE}" &>/dev/null || true
+            log_info "Ensured WiFi powersave is disabled for profile: ${connection_name}"
+        else
+            log_warn "Could not determine WiFi connection profile for powersave policy"
+        fi
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
+    fi
+}
+
+apply_recording_safe_recovery_policy() {
+    local now
+    now=$(date +%s)
+
+    if [ "${THRASH_PAUSE_UNTIL}" -gt "${now}" ]; then
+        log_warn "Recovery pacing pause active for $((THRASH_PAUSE_UNTIL - now))s"
+        return 1
+    fi
+
+    if [ "${DISRUPTIVE_WINDOW_START}" -eq 0 ] || [ $((now - DISRUPTIVE_WINDOW_START)) -ge 3600 ]; then
+        DISRUPTIVE_WINDOW_START="${now}"
+        DISRUPTIVE_ACTION_COUNT=0
+    fi
+
+    if [ "${LAST_DISRUPTIVE_ACTION_TIME}" -gt 0 ] && [ $((now - LAST_DISRUPTIVE_ACTION_TIME)) -lt "${RECOVERY_ACTION_MIN_INTERVAL}" ]; then
+        return 1
+    fi
+
+    if [ "${DISRUPTIVE_ACTION_COUNT}" -ge "${MAX_DISRUPTIVE_ACTIONS_PER_HOUR}" ]; then
+        THRASH_PAUSE_UNTIL=$((now + THRASH_PAUSE_SECONDS))
+        log_warn "Disruptive action budget reached (${MAX_DISRUPTIVE_ACTIONS_PER_HOUR}/hr); pausing recovery actions for ${THRASH_PAUSE_SECONDS}s"
+        persist_state_if_due
+        return 1
+    fi
+
+    return 0
+}
+
+record_disruptive_action() {
+    local action="$1"
+    local now
+    now=$(date +%s)
+    LAST_DISRUPTIVE_ACTION_TIME="${now}"
+    DISRUPTIVE_ACTION_COUNT=$((DISRUPTIVE_ACTION_COUNT + 1))
+    if [ "${action}" = "full_reset" ]; then
+        LAST_FULL_RESET_TIME="${now}"
+    fi
+    log_warn "Recovery action executed: ${action} (window count: ${DISRUPTIVE_ACTION_COUNT}/${MAX_DISRUPTIVE_ACTIONS_PER_HOUR})"
+    persist_state_if_due
+}
+
 load_persistent_state() {
     if [ ! -f "${WATCHDOG_STATE_FILE}" ]; then
         return 0
@@ -146,7 +312,7 @@ load_persistent_state() {
         key="${key%$'\r'}"
         value="${value%$'\r'}"
         case "${key}" in
-            CONSECUTIVE_WIFI_FAILURES|TOTAL_RECONNECTS|LAST_CONNECTED_TIME|LAST_FAILURE_TIME|LAST_RECOVERY_TIME)
+            CONSECUTIVE_WIFI_FAILURES|TOTAL_RECONNECTS|LAST_CONNECTED_TIME|LAST_FAILURE_TIME|LAST_RECOVERY_TIME|LAST_DISRUPTIVE_ACTION_TIME|LAST_FULL_RESET_TIME|DISRUPTIVE_WINDOW_START|DISRUPTIVE_ACTION_COUNT|THRASH_PAUSE_UNTIL)
                 if [[ "${value}" =~ ^[0-9]+$ ]]; then
                     printf -v "${key}" '%s' "${value}"
                 fi
@@ -171,6 +337,11 @@ persist_state() {
         printf 'LAST_FAILURE_REASON=%s\n' "${LAST_FAILURE_REASON}"
         printf 'LAST_FAILURE_TIME=%s\n' "${LAST_FAILURE_TIME}"
         printf 'LAST_RECOVERY_TIME=%s\n' "${LAST_RECOVERY_TIME}"
+        printf 'LAST_DISRUPTIVE_ACTION_TIME=%s\n' "${LAST_DISRUPTIVE_ACTION_TIME}"
+        printf 'LAST_FULL_RESET_TIME=%s\n' "${LAST_FULL_RESET_TIME}"
+        printf 'DISRUPTIVE_WINDOW_START=%s\n' "${DISRUPTIVE_WINDOW_START}"
+        printf 'DISRUPTIVE_ACTION_COUNT=%s\n' "${DISRUPTIVE_ACTION_COUNT}"
+        printf 'THRASH_PAUSE_UNTIL=%s\n' "${THRASH_PAUSE_UNTIL}"
     } > "${tmp_file}" 2>/dev/null || return 1
 
     if ! mv -f "${tmp_file}" "${WATCHDOG_STATE_FILE}" 2>/dev/null; then
@@ -449,7 +620,7 @@ handle_cli_command() {
 
 networkmanager_running() {
     command -v nmcli &>/dev/null || return 1
-    nmcli -t -f RUNNING general 2>/dev/null | grep -qx "running"
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli -t -f RUNNING general 2>/dev/null | grep -qx "running"
 }
 
 get_nm_wifi_connection_name() {
@@ -459,7 +630,7 @@ get_nm_wifi_connection_name() {
     fi
 
     local active_connection
-    active_connection=$(nmcli -g GENERAL.CONNECTION device show "${WIFI_INTERFACE}" 2>/dev/null | head -1 || true)
+    active_connection=$(run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli -g GENERAL.CONNECTION device show "${WIFI_INTERFACE}" 2>/dev/null | head -1 || true)
     if [ -n "${active_connection}" ] && [ "${active_connection}" != "--" ]; then
         echo "${active_connection}"
         return 0
@@ -471,18 +642,23 @@ get_nm_wifi_connection_name() {
 try_nmcli_reconnect() {
     networkmanager_running || return 1
 
-    nmcli radio wifi on &>/dev/null || true
-    nmcli device set "${WIFI_INTERFACE}" managed yes &>/dev/null || true
-    nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
+    if command_exists iw; then
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" set power_save off &>/dev/null || true
+    fi
+
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli radio wifi on &>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" managed yes &>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
 
     local connection_name
     connection_name=$(get_nm_wifi_connection_name || true)
     if [ -n "${connection_name}" ]; then
-        nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
-        nmcli connection up id "${connection_name}" ifname "${WIFI_INTERFACE}" &>/dev/null && return 0
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.powersave 2 &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection up id "${connection_name}" ifname "${WIFI_INTERFACE}" &>/dev/null && return 0
     fi
 
-    nmcli device connect "${WIFI_INTERFACE}" &>/dev/null
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device connect "${WIFI_INTERFACE}" &>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -501,23 +677,23 @@ interface_has_carrier() {
 
 interface_has_ip() {
     local iface="$1"
-    ip addr show "${iface}" 2>/dev/null | grep -q "inet "
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip addr show "${iface}" 2>/dev/null | grep -q "inet "
 }
 
 get_interface_ipv4() {
     local iface="$1"
-    ip -o -4 addr show dev "${iface}" scope global 2>/dev/null | awk 'NR==1 {split($4, ip, "/"); print ip[1]}'
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip -o -4 addr show dev "${iface}" scope global 2>/dev/null | awk 'NR==1 {split($4, ip, "/"); print ip[1]}'
 }
 
 ping_via_interface() {
     local iface="$1"
     local host="$2"
-    ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" -I "${iface}" "$host" &>/dev/null
+    run_with_timeout "${COMMAND_TIMEOUT_PING}" ping -c "${PING_COUNT}" -W "${PING_TIMEOUT}" -I "${iface}" "$host" &>/dev/null
 }
 
 get_gateway_for_interface() {
     local iface="$1"
-    ip route show default dev "${iface}" 2>/dev/null | awk '/default/ {print $3}' | head -1
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip route show default dev "${iface}" 2>/dev/null | awk '/default/ {print $3}' | head -1
 }
 
 tcp_probe_via_interface() {
@@ -534,13 +710,13 @@ tcp_probe_via_interface() {
     fi
 
     if command_exists nc; then
-        nc -z -w "${TCP_PROBE_TIMEOUT}" -s "${source_ip}" "${CONNECTIVITY_TCP_HOST}" "${CONNECTIVITY_TCP_PORT}" &>/dev/null
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" nc -z -w "${TCP_PROBE_TIMEOUT}" -s "${source_ip}" "${CONNECTIVITY_TCP_HOST}" "${CONNECTIVITY_TCP_PORT}" &>/dev/null
         return $?
     fi
 
     if command_exists timeout; then
         # /dev/tcp fallback is less strict because it cannot bind to a specific source IP.
-        timeout "${TCP_PROBE_TIMEOUT}" bash -c "exec 3<>/dev/tcp/${CONNECTIVITY_TCP_HOST}/${CONNECTIVITY_TCP_PORT}" &>/dev/null
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" timeout "${TCP_PROBE_TIMEOUT}" bash -c "exec 3<>/dev/tcp/${CONNECTIVITY_TCP_HOST}/${CONNECTIVITY_TCP_PORT}" &>/dev/null
         return $?
     fi
 
@@ -556,7 +732,7 @@ http_probe_via_interface() {
     fi
 
     if command_exists curl; then
-        curl --silent --show-error --fail \
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" curl --silent --show-error --fail \
             --connect-timeout "${HTTP_PROBE_TIMEOUT}" \
             --max-time "${HTTP_PROBE_TIMEOUT}" \
             --interface "${iface}" \
@@ -567,7 +743,7 @@ http_probe_via_interface() {
 
     source_ip=$(get_interface_ipv4 "${iface}")
     if [ -n "${source_ip}" ] && command_exists wget; then
-        wget --quiet --spider \
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" wget --quiet --spider \
             --tries=1 \
             --timeout="${HTTP_PROBE_TIMEOUT}" \
             --bind-address="${source_ip}" \
@@ -607,6 +783,7 @@ check_interface_connectivity() {
     local gw
     gw=$(get_gateway_for_interface "$iface")
     if [ -n "$gw" ]; then
+        notify_watchdog
         if ping_via_interface "$iface" "$gw"; then
             return 0
         fi
@@ -614,12 +791,14 @@ check_interface_connectivity() {
 
     # Try fallback targets
     for target in "${PING_TARGETS[@]}"; do
+        notify_watchdog
         if ping_via_interface "$iface" "$target"; then
             return 0
         fi
     done
 
     # Optional fallback probes for networks that block ICMP.
+    notify_watchdog
     if probe_non_icmp_connectivity "${iface}"; then
         return 0
     fi
@@ -632,24 +811,24 @@ wifi_is_associated() {
     local ssid
 
     if command_exists iwgetid; then
-        ssid=$(iwgetid "${WIFI_INTERFACE}" -r 2>/dev/null || true)
+        ssid=$(run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iwgetid "${WIFI_INTERFACE}" -r 2>/dev/null || true)
         if [ -n "${ssid}" ]; then
             return 0
         fi
     fi
 
-    if command_exists iw && iw dev "${WIFI_INTERFACE}" link 2>/dev/null | grep -q '^Connected to '; then
+    if command_exists iw && run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" link 2>/dev/null | grep -q '^Connected to '; then
         return 0
     fi
 
     if networkmanager_running; then
-        if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^${WIFI_INTERFACE}:connected$"; then
+        if run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^${WIFI_INTERFACE}:connected$"; then
             return 0
         fi
     fi
 
     if command_exists wpa_cli; then
-        if wpa_cli -i "${WIFI_INTERFACE}" status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
+        if run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
             return 0
         fi
     fi
@@ -722,6 +901,8 @@ update_wired_state() {
 # ---------------------------------------------------------------------------
 
 do_reassociate() {
+    apply_recording_safe_recovery_policy || return 0
+
     if try_nmcli_reconnect; then
         log_info "Escalation 1/${FULL_RESET_AFTER}: nmcli reconnect"
         mqtt_report "reassociate" "Attempting NetworkManager reconnect"
@@ -729,97 +910,91 @@ do_reassociate() {
         log_info "Escalation 1/${FULL_RESET_AFTER}: wpa_cli reassociate"
         mqtt_report "reassociate" "Attempting wpa_cli reassociate"
 
-        wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
-        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
     fi
 
-    sleep "${COOLDOWN_SHORT}"
+    record_disruptive_action "reassociate"
+    sleep_with_watchdog "${COOLDOWN_SHORT}"
 }
 
 do_ifupdown() {
+    apply_recording_safe_recovery_policy || return 0
+
     log_info "Escalation 2/${FULL_RESET_AFTER}: Bouncing interface ${WIFI_INTERFACE}"
     mqtt_report "ifupdown" "Bouncing WiFi interface"
 
     if try_nmcli_reconnect; then
         :
     elif command -v ifdown &>/dev/null; then
-        ifdown "${WIFI_INTERFACE}" 2>/dev/null || true
-        sleep 2
-        ifup "${WIFI_INTERFACE}" 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ifdown "${WIFI_INTERFACE}" 2>/dev/null || true
+        sleep_with_watchdog 2
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ifup "${WIFI_INTERFACE}" 2>/dev/null || true
     else
-        ip link set "${WIFI_INTERFACE}" down 2>/dev/null || true
-        sleep 2
-        ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" down 2>/dev/null || true
+        sleep_with_watchdog 2
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
     fi
 
-    sleep "${COOLDOWN_MEDIUM}"
+    record_disruptive_action "ifupdown"
+    sleep_with_watchdog "${COOLDOWN_MEDIUM}"
     request_dhcp
 }
 
 do_rfkill_cycle() {
+    apply_recording_safe_recovery_policy || return 0
+
     log_info "Escalation 3/${FULL_RESET_AFTER}: rfkill power-cycle"
     mqtt_report "rfkill" "Power-cycling WiFi radio"
 
     if networkmanager_running; then
-        nmcli radio wifi off &>/dev/null || true
-        sleep 3
-        nmcli radio wifi on &>/dev/null || true
-        sleep 5
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli radio wifi off &>/dev/null || true
+        sleep_with_watchdog 3
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli radio wifi on &>/dev/null || true
+        sleep_with_watchdog 5
         try_nmcli_reconnect || true
     elif command -v rfkill &>/dev/null; then
-        rfkill block wifi 2>/dev/null || true
-        sleep 3
-        rfkill unblock wifi 2>/dev/null || true
-        sleep 5
-        ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" rfkill block wifi 2>/dev/null || true
+        sleep_with_watchdog 3
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" rfkill unblock wifi 2>/dev/null || true
+        sleep_with_watchdog 5
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
     else
         log_warn "rfkill not available, skipping"
     fi
 
-    sleep "${COOLDOWN_MEDIUM}"
+    record_disruptive_action "rfkill"
+    sleep_with_watchdog "${COOLDOWN_MEDIUM}"
     request_dhcp
-}
-
-do_restart_services() {
-    log_info "Escalation 4/${FULL_RESET_AFTER}: Restarting networking services"
-    if networkmanager_running; then
-        mqtt_report "restart_services" "Restarting NetworkManager"
-        systemctl restart NetworkManager 2>/dev/null || true
-        sleep 5
-        try_nmcli_reconnect || true
-    else
-        mqtt_report "restart_services" "Restarting wpa_supplicant, dhcpcd, networking"
-
-        systemctl restart wpa_supplicant 2>/dev/null || true
-        sleep 3
-
-        if systemctl list-units --type=service --all 2>/dev/null | grep -q dhcpcd; then
-            systemctl restart dhcpcd 2>/dev/null || true
-            sleep 5
-        fi
-
-        systemctl restart networking 2>/dev/null || true
-    fi
-
-    sleep "${COOLDOWN_LONG}"
 }
 
 do_full_reset() {
+    local now
+    now=$(date +%s)
+
+    apply_recording_safe_recovery_policy || return 0
+
+    if [ "${LAST_FULL_RESET_TIME}" -gt 0 ] && [ $((now - LAST_FULL_RESET_TIME)) -lt "${FULL_RESET_MIN_INTERVAL}" ]; then
+        log_warn "Escalation 5/${FULL_RESET_AFTER}: full reset deferred (min interval ${FULL_RESET_MIN_INTERVAL}s)"
+        return 0
+    fi
+
     log_info "Escalation 5/${FULL_RESET_AFTER}: Full interface reset"
     mqtt_report "full_reset" "Full WiFi interface teardown and rebuild"
 
-    ip addr flush dev "${WIFI_INTERFACE}" 2>/dev/null || true
-    ip route flush dev "${WIFI_INTERFACE}" 2>/dev/null || true
-    ip link set "${WIFI_INTERFACE}" down 2>/dev/null || true
-    sleep 3
-    ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
-    sleep 5
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip addr flush dev "${WIFI_INTERFACE}" 2>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip route flush dev "${WIFI_INTERFACE}" 2>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" down 2>/dev/null || true
+    sleep_with_watchdog 3
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
+    sleep_with_watchdog 5
     if ! try_nmcli_reconnect; then
-        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
     fi
-    sleep 5
+    sleep_with_watchdog 5
     request_dhcp
-    sleep "${COOLDOWN_LONG}"
+    record_disruptive_action "full_reset"
+    sleep_with_watchdog "${COOLDOWN_LONG}"
 }
 
 request_dhcp() {
@@ -828,10 +1003,10 @@ request_dhcp() {
     fi
 
     if command -v dhclient &>/dev/null; then
-        dhclient -r "${WIFI_INTERFACE}" 2>/dev/null || true
-        dhclient "${WIFI_INTERFACE}" 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DHCP}" dhclient -r "${WIFI_INTERFACE}" 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DHCP}" dhclient "${WIFI_INTERFACE}" 2>/dev/null || true
     elif command -v dhcpcd &>/dev/null; then
-        dhcpcd -n "${WIFI_INTERFACE}" 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DHCP}" dhcpcd -n "${WIFI_INTERFACE}" 2>/dev/null || true
     fi
 }
 
@@ -845,13 +1020,11 @@ escalate_wifi() {
     log_warn "WiFi check failed (consecutive: ${CONSECUTIVE_WIFI_FAILURES}, mode: ${MODE})"
     persist_state_if_due
 
-    # Pick escalation level, cycling back after full_reset
-    local level=$(( (CONSECUTIVE_WIFI_FAILURES - 1) % FULL_RESET_AFTER + 1 ))
+    # Pick escalation level without cycling to avoid recovery thrash.
+    local level="${CONSECUTIVE_WIFI_FAILURES}"
 
     if [ "$level" -ge "${FULL_RESET_AFTER}" ]; then
         do_full_reset
-    elif [ "$level" -ge "${RESTART_SERVICES_AFTER}" ]; then
-        do_restart_services
     elif [ "$level" -ge "${RFKILL_AFTER}" ]; then
         do_rfkill_cycle
     elif [ "$level" -ge "${IFUPDOWN_AFTER}" ]; then
@@ -898,23 +1071,23 @@ ensure_wifi_up() {
     mqtt_report "failover_start" "Wired down, activating WiFi"
 
     # Make sure the interface is up.
-    ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" ip link set "${WIFI_INTERFACE}" up 2>/dev/null || true
 
     # Make sure rfkill is not blocking it.
     if command_exists rfkill; then
-        rfkill unblock wifi 2>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" rfkill unblock wifi 2>/dev/null || true
     fi
 
     # Ask wpa_supplicant (or NetworkManager) to connect.
     if ! try_nmcli_reconnect; then
-        wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
-        wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
+        run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
     fi
 
     # Wait for association and request DHCP.
-    sleep 10
+    sleep_with_watchdog 10
     request_dhcp
-    sleep 5
+    sleep_with_watchdog 5
 
     # Check if it worked.
     if check_wifi_connectivity; then
@@ -957,6 +1130,7 @@ if ! ensure_state_dir; then
 fi
 load_persistent_state
 trap 'persist_state || true' EXIT
+enforce_wifi_powersave_off
 
 # ---------------------------------------------------------------------------
 # Startup
@@ -968,12 +1142,19 @@ log_info "WiFi interface: ${WIFI_INTERFACE}"
 log_info "Wired interface: ${WIRED_INTERFACE}"
 log_info "========================================="
 log_info "Check intervals: wifi_primary=${CHECK_INTERVAL_WIFI_PRIMARY}s, wired_ok=${CHECK_INTERVAL_WIRED_OK}s, wired_dropped=${CHECK_INTERVAL_WIRED_JUST_DROPPED}s"
-log_info "Escalation: reassociate@${REASSOCIATE_AFTER}, ifupdown@${IFUPDOWN_AFTER}, rfkill@${RFKILL_AFTER}, restart@${RESTART_SERVICES_AFTER}, full_reset@${FULL_RESET_AFTER} (cycles)"
+log_info "Escalation: reassociate@${REASSOCIATE_AFTER}, ifupdown@${IFUPDOWN_AFTER}, rfkill@${RFKILL_AFTER}, full_reset@${FULL_RESET_AFTER}"
+log_info "Always-recording mode: ${ALWAYS_RECORDING_MODE} (network service restarts disabled: yes)"
+log_info "Recovery pacing: min_interval=${RECOVERY_ACTION_MIN_INTERVAL}s, full_reset_min_interval=${FULL_RESET_MIN_INTERVAL}s, max_disruptive_per_hour=${MAX_DISRUPTIVE_ACTIONS_PER_HOUR}, pause=${THRASH_PAUSE_SECONDS}s"
 log_info "State file: ${WATCHDOG_STATE_FILE} (total reconnects: ${TOTAL_RECONNECTS}, consecutive failures: ${CONSECUTIVE_WIFI_FAILURES})"
+if [ -n "${WATCHDOG_USEC:-}" ]; then
+    log_info "systemd watchdog interval: $((WATCHDOG_USEC / 1000000))s"
+else
+    log_warn "systemd watchdog interval not provided (WATCHDOG_USEC unset)"
+fi
 mqtt_report "started" "WiFi watchdog started (wired-aware mode)"
 
 # Give the system a moment to bring up networking on boot
-sleep 10
+sleep_with_watchdog 10
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -1038,5 +1219,5 @@ while true; do
     notify_watchdog
     persist_state_if_due
     local_interval=$(get_check_interval)
-    sleep "${local_interval}"
+    sleep_with_watchdog "${local_interval}"
 done

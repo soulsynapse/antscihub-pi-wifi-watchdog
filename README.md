@@ -21,8 +21,7 @@ The recovery ladder is now NetworkManager-aware.
 1. `nmcli` reconnect (fallback to `wpa_cli` reassociate/reconfigure)
 2. Interface bounce (tries `nmcli` first, then `ifdown/ifup` or `ip link`)
 3. Radio power cycle (`nmcli radio wifi off/on` or `rfkill`)
-4. Restart network services (prefers `NetworkManager` when active)
-5. Full interface reset and reconnect
+4. Full interface reset and reconnect
 
 When `NetworkManager` is running, watchdog prefers `nmcli` operations and avoids forcing legacy DHCP renewals.
 
@@ -36,6 +35,16 @@ The script supports these key environment variables:
 - `CONNECTIVITY_HTTP_URL` (default: empty, optional non-ICMP probe)
 - `CONNECTIVITY_TCP_HOST` (default: empty, optional non-ICMP probe)
 - `CONNECTIVITY_TCP_PORT` (default: `443`)
+- `RECOVERY_ACTION_MIN_INTERVAL` (default: `45`)
+- `FULL_RESET_MIN_INTERVAL` (default: `180`)
+- `MAX_DISRUPTIVE_ACTIONS_PER_HOUR` (default: `12`)
+- `THRASH_PAUSE_SECONDS` (default: `300`)
+- `WATCHDOG_HEARTBEAT_SLICE` (default: `10`)
+- `COMMAND_TIMEOUT_DEFAULT` (default: `25`)
+- `COMMAND_TIMEOUT_PING` (default: `15`)
+- `COMMAND_TIMEOUT_DHCP` (default: `30`)
+- `COMMAND_TIMEOUT_NMCLI` (default: `20`)
+- `COMMAND_TIMEOUT_WPA_CLI` (default: `15`)
 - `WATCHDOG_STATE_FILE` (default: `/var/lib/wifi-watchdog/state.env`)
 - `SINGLETON_LOCK_FILE` (default: `/run/wifi-watchdog.lock`)
 
@@ -43,11 +52,17 @@ Set `WIFI_CONNECTION_NAME` when you want reconnect attempts to target a specific
 
 If your network blocks ICMP, set at least one of `CONNECTIVITY_HTTP_URL` or `CONNECTIVITY_TCP_HOST` to reduce false recovery escalations.
 
+By default, watchdog enforces WiFi power-save off (`wifi.powersave=2`) for NetworkManager and also applies `iw ... set power_save off` when available.
+
 ## Runtime Safeguards
 
 - Startup preflight validates required commands (`ip`, `ping`) and logs optional capability availability.
 - A singleton lock prevents concurrent watchdog processes.
 - Recovery counters and timestamps persist across restarts in the state file.
+- Anti-thrash pacing limits disruptive recovery actions and adds a temporary pause if the action budget is exceeded.
+- Watchdog always assumes recordings are active, so it skips network service restarts and only performs WiFi-scoped recovery actions.
+- Long waits are chunked with periodic `systemd` watchdog heartbeats to avoid watchdog timeouts during recovery cooldowns.
+- Recovery commands are timeout-bounded to reduce hangs from stuck WiFi/SDIO stack operations (`timeout` is used when available, with a watchdog-aware fallback timer otherwise).
 
 ## Diagnostics Report
 
