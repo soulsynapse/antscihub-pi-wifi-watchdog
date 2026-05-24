@@ -33,8 +33,46 @@ The script supports these key environment variables:
 - `WIFI_INTERFACE` (default: `wlan0`)
 - `WIRED_INTERFACE` (default: `eth0`)
 - `WIFI_CONNECTION_NAME` (default: empty)
+- `CONNECTIVITY_HTTP_URL` (default: empty, optional non-ICMP probe)
+- `CONNECTIVITY_TCP_HOST` (default: empty, optional non-ICMP probe)
+- `CONNECTIVITY_TCP_PORT` (default: `443`)
+- `WATCHDOG_STATE_FILE` (default: `/var/lib/wifi-watchdog/state.env`)
+- `SINGLETON_LOCK_FILE` (default: `/run/wifi-watchdog.lock`)
 
 Set `WIFI_CONNECTION_NAME` when you want reconnect attempts to target a specific saved NM profile (for example enterprise WiFi like `asu`).
+
+If your network blocks ICMP, set at least one of `CONNECTIVITY_HTTP_URL` or `CONNECTIVITY_TCP_HOST` to reduce false recovery escalations.
+
+## Runtime Safeguards
+
+- Startup preflight validates required commands (`ip`, `ping`) and logs optional capability availability.
+- A singleton lock prevents concurrent watchdog processes.
+- Recovery counters and timestamps persist across restarts in the state file.
+
+## Diagnostics Report
+
+After install, use this command on the Pi:
+
+```bash
+watchdog report
+```
+
+It writes a concise summary report to:
+
+- `~/Desktop/5-UPLOAD/diagnostics`
+
+Filename format:
+
+- `watchdog_report_YYYY-MM-DD_T-HH-MM-SS__(hostname).txt`
+
+The report includes:
+
+- Service state and restart counters
+- Recent down/failure events
+- Recent reconnect/recovery events
+- Recent watchdog recovery actions
+- Compact network snapshot for `eth0` and `wlan0`
+- Recent watchdog log tail (bounded)
 
 ## Enterprise WiFi (NetworkManager) Notes
 

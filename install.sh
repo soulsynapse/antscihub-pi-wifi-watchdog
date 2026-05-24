@@ -2,36 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_TEMPLATE="${SCRIPT_DIR}/wifi-watchdog.service"
+UNIT_TARGET="/etc/systemd/system/wifi-watchdog.service"
 
-# Generate systemd unit with absolute path
-cat > /etc/systemd/system/wifi-watchdog.service << EOF
-[Unit]
-Description=WiFi Watchdog - automatic network reconnection service
-After=sys-subsystem-net-devices-wlan0.device fleet-shell.service
-Wants=sys-subsystem-net-devices-wlan0.device
+if [ ! -f "${UNIT_TEMPLATE}" ]; then
+    echo "[wifi-watchdog] missing service template: ${UNIT_TEMPLATE}" >&2
+    exit 1
+fi
 
-StartLimitIntervalSec=0
-
-[Service]
-Type=simple
-ExecStart=${SCRIPT_DIR}/wifi-watchdog.sh
-WorkingDirectory=${SCRIPT_DIR}
-Restart=always
-RestartSec=3
-User=root
-
-StartLimitBurst=0
-WatchdogSec=120
-
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-[Install]
-WantedBy=multi-user.target
-EOF
+escaped_script_dir=$(printf '%s\n' "${SCRIPT_DIR}" | sed 's/[\\/&]/\\&/g')
+sed "s/__WATCHDOG_DIR__/${escaped_script_dir}/g" "${UNIT_TEMPLATE}" > "${UNIT_TARGET}"
 
 systemctl daemon-reload
 systemctl enable wifi-watchdog.service
 
 chmod +x "${SCRIPT_DIR}/wifi-watchdog.sh"
+
+cat > /usr/local/bin/watchdog << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "${SCRIPT_DIR}/wifi-watchdog.sh" "\$@"
+EOF
+
+chmod +x /usr/local/bin/watchdog
 
 echo "[wifi-watchdog] install complete"

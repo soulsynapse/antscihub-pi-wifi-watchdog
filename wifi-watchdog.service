@@ -7,11 +7,14 @@ Wants=sys-subsystem-net-devices-wlan0.device
 StartLimitIntervalSec=0
 
 [Service]
+# install.sh renders __WATCHDOG_DIR__ to the module's absolute path.
 Type=simple
-ExecStart=/bin/bash -c 'exec "$(find /home/*/Desktop/3-SYSTEM/wifi-watchdog/wifi-watchdog.sh 2>/dev/null | head -1)"'
+ExecStart=__WATCHDOG_DIR__/wifi-watchdog.sh
+WorkingDirectory=__WATCHDOG_DIR__
 Restart=always
 RestartSec=3
 User=root
+NotifyAccess=main
 
 StartLimitBurst=0
 WatchdogSec=300
