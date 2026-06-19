@@ -53,6 +53,7 @@ COMMAND_TIMEOUT_PING="${COMMAND_TIMEOUT_PING:-15}"
 COMMAND_TIMEOUT_DHCP="${COMMAND_TIMEOUT_DHCP:-30}"
 COMMAND_TIMEOUT_NMCLI="${COMMAND_TIMEOUT_NMCLI:-20}"
 COMMAND_TIMEOUT_WPA_CLI="${COMMAND_TIMEOUT_WPA_CLI:-15}"
+RECENT_REASON_LOG_WINDOW_SECONDS="${RECENT_REASON_LOG_WINDOW_SECONDS:-180}"
 
 # Check intervals
 CHECK_INTERVAL_WIFI_PRIMARY=15    # WiFi is our only link — check aggressively
@@ -130,17 +131,33 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*"
 }
 
+json_escape() {
+    local value="${1:-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '%s' "${value}"
+}
+
 mqtt_report() {
     local event="$1"
     local message="$2"
+    local event_json message_json device_json mode_json
+
     if command -v fleet-publish &>/dev/null; then
+        event_json=$(json_escape "${event}")
+        message_json=$(json_escape "${message}")
+        device_json=$(json_escape "${DEVICE_ID}")
+        mode_json=$(json_escape "${MODE}")
+
         fleet-publish \
             --topic "fleet/response/${DEVICE_ID}" \
-            --json "{\"schema\":\"fleet.service-manager.v1\",\"event\":\"${event}\",\"service\":\"wifi-watchdog\",\"device_id\":\"${DEVICE_ID}\",\"timestamp\":$(date +%s),\"message\":\"${message}\",\"mode\":\"${MODE}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS}}" \
+            --json "{\"schema\":\"fleet.service-manager.v1\",\"event\":\"${event_json}\",\"service\":\"wifi-watchdog\",\"device_id\":\"${device_json}\",\"timestamp\":$(date +%s),\"message\":\"${message_json}\",\"mode\":\"${mode_json}\",\"consecutive_failures\":${CONSECUTIVE_WIFI_FAILURES},\"total_reconnects\":${TOTAL_RECONNECTS}}" \
             2>/dev/null || true
     fi
 }
-
 notify_watchdog() {
     if [ -n "${WATCHDOG_USEC:-}" ]; then
         systemd-notify WATCHDOG=1 2>/dev/null || true
@@ -584,6 +601,150 @@ emit_recent_matches() {
     fi
 }
 
+compact_text() {
+    { if [ "$#" -gt 0 ]; then printf '%s' "$*"; else cat; fi; } \
+        | tr '\r\n' '  ' \
+        | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' \
+        | cut -c 1-220
+}
+
+latest_matching_line() {
+    local logs="$1"
+    local pattern="$2"
+
+    printf '%s\n' "${logs}" | grep -Ei "${pattern}" | tail -1 | compact_text
+}
+
+recent_networkmanager_wifi_hint() {
+    local logs
+    logs=$(read_watchdog_journal -u NetworkManager --since "${RECENT_REASON_LOG_WINDOW_SECONDS} seconds ago" -o short-iso --no-pager || true)
+    latest_matching_line "${logs}" "${WIFI_INTERFACE}|p2p-dev-${WIFI_INTERFACE}|disconnect|deauth|disassoc|reason|dhcp4|supplicant|scan|associat"
+}
+
+recent_kernel_wifi_hint() {
+    local logs
+    logs=$(read_watchdog_journal -k --since "${RECENT_REASON_LOG_WINDOW_SECONDS} seconds ago" -o short-iso --no-pager || true)
+    latest_matching_line "${logs}" "${WIFI_INTERFACE}|brcm|brcmfmac|cfg80211|deauth|disassoc|firmware|scan|undervoltage|thrott"
+}
+
+wifi_nm_status_summary() {
+    local state connection
+
+    if ! networkmanager_running; then
+        echo "nm=unavailable"
+        return 0
+    fi
+
+    state=$(run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli -g GENERAL.STATE device show "${WIFI_INTERFACE}" 2>/dev/null | head -1 || true)
+    connection=$(run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli -g GENERAL.CONNECTION device show "${WIFI_INTERFACE}" 2>/dev/null | head -1 || true)
+    [ "${connection}" = "--" ] && connection=""
+
+    echo "nm=${state:-unknown}${connection:+ connection=${connection}}"
+}
+
+wifi_wpa_status_summary() {
+    local status wpa_state ssid bssid
+
+    if ! command_exists wpa_cli; then
+        echo "wpa=unavailable"
+        return 0
+    fi
+
+    status=$(run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" status 2>/dev/null || true)
+    wpa_state=$(printf '%s\n' "${status}" | awk -F= '$1 == "wpa_state" {print $2; exit}')
+    ssid=$(printf '%s\n' "${status}" | awk -F= '$1 == "ssid" {print $2; exit}')
+    bssid=$(printf '%s\n' "${status}" | awk -F= '$1 == "bssid" {print $2; exit}')
+
+    echo "wpa=${wpa_state:-unknown}${ssid:+ ssid=${ssid}}${bssid:+ bssid=${bssid}}"
+}
+
+wifi_link_summary() {
+    local link bssid ssid freq signal
+
+    if ! command_exists iw; then
+        echo "link=iw unavailable"
+        return 0
+    fi
+
+    link=$(run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" link 2>/dev/null || true)
+    if printf '%s\n' "${link}" | grep -qi 'not connected'; then
+        echo "link=not associated"
+        return 0
+    fi
+
+    bssid=$(printf '%s\n' "${link}" | awk '/Connected to/ {print $3; exit}')
+    ssid=$(printf '%s\n' "${link}" | awk -F': ' '/SSID:/ {print $2; exit}')
+    freq=$(printf '%s\n' "${link}" | awk '/freq:/ {print $2; exit}')
+    signal=$(printf '%s\n' "${link}" | awk '/signal:/ {print $2 " " $3; exit}')
+
+    echo "link=${bssid:-unknown}${ssid:+ ssid=${ssid}}${freq:+ freq=${freq}}${signal:+ signal=${signal}}"
+}
+
+wifi_route_summary() {
+    local ip4 gateway
+
+    ip4=$(get_interface_ipv4 "${WIFI_INTERFACE}" || true)
+    gateway=$(get_gateway_for_interface "${WIFI_INTERFACE}" || true)
+    echo "ip=${ip4:-none}${gateway:+ gw=${gateway}}"
+}
+
+classify_wifi_failure() {
+    if ! interface_exists "${WIFI_INTERFACE}"; then
+        echo "interface ${WIFI_INTERFACE} missing"
+        return 0
+    fi
+
+    if command_exists rfkill && run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" rfkill list wifi 2>/dev/null | grep -Eiq 'blocked: yes'; then
+        echo "WiFi radio blocked by rfkill"
+        return 0
+    fi
+
+    if ! wifi_is_associated; then
+        echo "not associated to WiFi"
+        return 0
+    fi
+
+    if ! interface_has_ip "${WIFI_INTERFACE}"; then
+        echo "associated but no IPv4 lease"
+        return 0
+    fi
+
+    if [ -z "$(get_gateway_for_interface "${WIFI_INTERFACE}" || true)" ]; then
+        echo "associated with IPv4 but no default route"
+        return 0
+    fi
+
+    echo "associated, but connectivity probes failed"
+}
+
+build_wifi_failure_message() {
+    local reason link route nm_status wpa_status nm_hint kernel_hint message
+
+    reason=$(classify_wifi_failure)
+    link=$(wifi_link_summary)
+    route=$(wifi_route_summary)
+    nm_status=$(wifi_nm_status_summary)
+    wpa_status=$(wifi_wpa_status_summary)
+    nm_hint=$(recent_networkmanager_wifi_hint || true)
+    kernel_hint=$(recent_kernel_wifi_hint || true)
+
+    message="WiFi failure: ${reason}; ${link}; ${route}; ${nm_status}; ${wpa_status}"
+    if [ -n "${nm_hint}" ]; then
+        message="${message}; last_nm=${nm_hint}"
+    fi
+    if [ -n "${kernel_hint}" ]; then
+        message="${message}; last_kernel=${kernel_hint}"
+    fi
+
+    compact_text "${message}" | cut -c 1-1000
+}
+
+publish_wifi_failure_reason() {
+    local message
+    message=$(build_wifi_failure_message)
+    log_warn "${message}"
+    mqtt_report "wifi_down" "${message}"
+}
 render_interface_snapshot() {
     local iface="$1"
 
@@ -1124,6 +1285,9 @@ escalate_wifi() {
     CONSECUTIVE_WIFI_FAILURES=$((CONSECUTIVE_WIFI_FAILURES + 1))
     mark_failure "wifi_check_failed"
     log_warn "WiFi check failed (consecutive: ${CONSECUTIVE_WIFI_FAILURES}, mode: ${MODE})"
+    if [ "${CONSECUTIVE_WIFI_FAILURES}" -eq 1 ]; then
+        publish_wifi_failure_reason
+    fi
     persist_state_if_due
 
     # Pick escalation level without cycling to avoid recovery thrash.
