@@ -538,10 +538,11 @@ acquire_singleton_lock() {
 
 print_usage() {
     cat <<EOF
-Usage: $(basename "$0") [run|report|help]
+Usage: $(basename "$0") [run|report|diagnose|help]
 
   run      Start WiFi watchdog loop (default)
   report   Write a concise watchdog diagnostic report to Desktop/5-UPLOAD/diagnostics
+  diagnose  Print and publish the current WiFi diagnostic reason snapshot
   help     Show this help message
 EOF
 }
@@ -604,15 +605,14 @@ emit_recent_matches() {
 compact_text() {
     { if [ "$#" -gt 0 ]; then printf '%s' "$*"; else cat; fi; } \
         | tr '\r\n' '  ' \
-        | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' \
-        | cut -c 1-220
+        | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
 }
 
 latest_matching_line() {
     local logs="$1"
     local pattern="$2"
 
-    printf '%s\n' "${logs}" | grep -Ei "${pattern}" | tail -1 | compact_text
+    printf '%s\n' "${logs}" | grep -Ei "${pattern}" | tail -1 | compact_text | cut -c 1-220
 }
 
 recent_networkmanager_wifi_hint() {
@@ -640,6 +640,12 @@ wifi_nm_status_summary() {
     [ "${connection}" = "--" ] && connection=""
 
     echo "nm=${state:-unknown}${connection:+ connection=${connection}}"
+}
+
+current_wpa_state() {
+    command_exists wpa_cli || return 1
+    run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" status 2>/dev/null \
+        | awk -F= '$1 == "wpa_state" {print $2; exit}'
 }
 
 wifi_wpa_status_summary() {
@@ -689,6 +695,13 @@ wifi_route_summary() {
 }
 
 classify_wifi_failure() {
+    local verify_connectivity="${1:-false}"
+
+    if is_truthy "${verify_connectivity}" && check_wifi_connectivity; then
+        echo "currently connected"
+        return 0
+    fi
+
     if ! interface_exists "${WIFI_INTERFACE}"; then
         echo "interface ${WIFI_INTERFACE} missing"
         return 0
@@ -701,6 +714,13 @@ classify_wifi_failure() {
 
     if ! wifi_is_associated; then
         echo "not associated to WiFi"
+        return 0
+    fi
+
+    local wpa_state
+    wpa_state=$(current_wpa_state || true)
+    if [ -n "${wpa_state}" ] && [ "${wpa_state}" != "COMPLETED" ]; then
+        echo "supplicant state ${wpa_state} (handshake/roam not complete)"
         return 0
     fi
 
@@ -720,7 +740,7 @@ classify_wifi_failure() {
 build_wifi_failure_message() {
     local reason link route nm_status wpa_status nm_hint kernel_hint message
 
-    reason=$(classify_wifi_failure)
+    reason=$(classify_wifi_failure "${1:-false}")
     link=$(wifi_link_summary)
     route=$(wifi_route_summary)
     nm_status=$(wifi_nm_status_summary)
@@ -863,6 +883,12 @@ handle_cli_command() {
         report)
             generate_watchdog_report
             exit $?
+            ;;
+        diagnose)
+            diagnostic_message=$(build_wifi_failure_message true)
+            echo "${diagnostic_message}"
+            mqtt_report "wifi_diagnostic" "${diagnostic_message}"
+            exit 0
             ;;
         help|-h|--help)
             print_usage
