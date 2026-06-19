@@ -34,6 +34,12 @@ CONNECTIVITY_TCP_PORT="${CONNECTIVITY_TCP_PORT:-443}"
 HTTP_PROBE_TIMEOUT="${HTTP_PROBE_TIMEOUT:-6}"
 TCP_PROBE_TIMEOUT="${TCP_PROBE_TIMEOUT:-5}"
 
+# Stationary Pi WiFi stability controls
+DISABLE_WIFI_STEERING="${DISABLE_WIFI_STEERING:-true}"
+DISABLE_WIFI_BGSCAN="${DISABLE_WIFI_BGSCAN:-true}"
+WIFI_BSSID="${WIFI_BSSID:-}"
+WIFI_BAND="${WIFI_BAND:-}"
+WIFI_CHANNEL="${WIFI_CHANNEL:-}"
 # Recovery pacing / anti-thrash controls
 RECOVERY_ACTION_MIN_INTERVAL="${RECOVERY_ACTION_MIN_INTERVAL:-45}"
 FULL_RESET_MIN_INTERVAL="${FULL_RESET_MIN_INTERVAL:-180}"
@@ -59,10 +65,10 @@ PING_TIMEOUT=5
 PING_COUNT=2
 
 # Escalation thresholds (consecutive WiFi failures)
-REASSOCIATE_AFTER=1
-IFUPDOWN_AFTER=3
-RFKILL_AFTER=5
-FULL_RESET_AFTER=10
+REASSOCIATE_AFTER="${REASSOCIATE_AFTER:-3}"
+IFUPDOWN_AFTER="${IFUPDOWN_AFTER:-5}"
+RFKILL_AFTER="${RFKILL_AFTER:-8}"
+FULL_RESET_AFTER="${FULL_RESET_AFTER:-12}"
 
 # Cooldowns after escalation actions
 COOLDOWN_SHORT=10
@@ -224,6 +230,122 @@ command_exists() {
     command -v "$1" &>/dev/null
 }
 
+is_truthy() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on|y)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+wpa_cli_ok() {
+    local output
+
+    command_exists wpa_cli || return 1
+    output=$(run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" "$@" 2>/dev/null || true)
+    printf '%s\n' "${output}" | grep -qx 'OK'
+}
+
+get_current_wpa_network_id() {
+    command_exists wpa_cli || return 1
+    run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" list_networks 2>/dev/null \
+        | awk -F '\t' '$0 ~ /\[CURRENT\]/ {print $1; exit}'
+}
+
+apply_wpa_stationary_policy() {
+    local network_id
+    local applied=0
+
+    if ! is_truthy "${DISABLE_WIFI_STEERING}" && ! is_truthy "${DISABLE_WIFI_BGSCAN}"; then
+        return 0
+    fi
+    command_exists wpa_cli || return 0
+
+    network_id=$(get_current_wpa_network_id || true)
+
+    if is_truthy "${DISABLE_WIFI_STEERING}"; then
+        # Builds vary: try both common BSS transition knob names and ignore unsupported ones.
+        if wpa_cli_ok set bss_transition 0; then
+            applied=1
+        fi
+        if wpa_cli_ok set bss_tm_disabled 1; then
+            applied=1
+        fi
+    fi
+
+    if [ -n "${network_id}" ]; then
+        if is_truthy "${DISABLE_WIFI_STEERING}"; then
+            if wpa_cli_ok set_network "${network_id}" bss_transition 0; then
+                applied=1
+            fi
+            if wpa_cli_ok set_network "${network_id}" bss_tm_disabled 1; then
+                applied=1
+            fi
+        fi
+
+        if is_truthy "${DISABLE_WIFI_BGSCAN}"; then
+            if wpa_cli_ok set_network "${network_id}" bgscan '""'; then
+                applied=1
+            fi
+        fi
+    fi
+
+    if [ "${applied}" -eq 1 ]; then
+        log_info "Applied wpa_supplicant stationary WiFi policy${network_id:+ to network ${network_id}}"
+    else
+        log_warn "Could not apply wpa_supplicant stationary WiFi policy; options may be unsupported or no current network is exposed"
+    fi
+}
+
+apply_nm_stationary_policy() {
+    local connection_name
+
+    networkmanager_running || return 0
+
+    if [ -d "/etc/NetworkManager/conf.d" ]; then
+        cat > /etc/NetworkManager/conf.d/10-wifi-powersave-off.conf <<EOF
+[connection]
+wifi.powersave=2
+EOF
+    fi
+
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli radio wifi on &>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" managed yes &>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
+
+    connection_name=$(get_nm_wifi_connection_name || true)
+    if [ -z "${connection_name}" ]; then
+        log_warn "Could not determine WiFi connection profile for NetworkManager stability policy"
+        return 0
+    fi
+
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.powersave 2 &>/dev/null || true
+    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
+
+    if [ -n "${WIFI_BSSID}" ]; then
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.bssid "${WIFI_BSSID}" &>/dev/null || true
+    fi
+    if [ -n "${WIFI_BAND}" ]; then
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.band "${WIFI_BAND}" &>/dev/null || true
+    fi
+    if [ -n "${WIFI_CHANNEL}" ]; then
+        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.channel "${WIFI_CHANNEL}" &>/dev/null || true
+    fi
+
+    log_info "Ensured NetworkManager WiFi stability policy for profile: ${connection_name}"
+}
+
+apply_wifi_stationary_policy() {
+    if command_exists iw; then
+        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" set power_save off &>/dev/null || true
+    fi
+
+    apply_nm_stationary_policy
+    apply_wpa_stationary_policy
+}
 ensure_state_dir() {
     mkdir -p "${WATCHDOG_STATE_DIR}" 2>/dev/null
 }
@@ -234,32 +356,7 @@ mark_failure() {
 }
 
 enforce_wifi_powersave_off() {
-    if command_exists iw; then
-        run_with_timeout "${COMMAND_TIMEOUT_DEFAULT}" iw dev "${WIFI_INTERFACE}" set power_save off &>/dev/null || true
-    fi
-
-    if networkmanager_running; then
-        local nm_powersave_conf
-        nm_powersave_conf="/etc/NetworkManager/conf.d/10-wifi-powersave-off.conf"
-        if [ -d "/etc/NetworkManager/conf.d" ]; then
-            cat > "${nm_powersave_conf}" <<EOF
-[connection]
-wifi.powersave=2
-EOF
-        fi
-
-        local connection_name
-        connection_name=$(get_nm_wifi_connection_name || true)
-        if [ -n "${connection_name}" ]; then
-            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.powersave 2 &>/dev/null || true
-            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
-            run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device reapply "${WIFI_INTERFACE}" &>/dev/null || true
-            log_info "Ensured WiFi powersave is disabled for profile: ${connection_name}"
-        else
-            log_warn "Could not determine WiFi connection profile for powersave policy"
-        fi
-        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device set "${WIFI_INTERFACE}" autoconnect yes &>/dev/null || true
-    fi
+    apply_wifi_stationary_policy
 }
 
 apply_recording_safe_recovery_policy() {
@@ -655,10 +752,18 @@ try_nmcli_reconnect() {
     if [ -n "${connection_name}" ]; then
         run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" 802-11-wireless.powersave 2 &>/dev/null || true
         run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection modify "${connection_name}" connection.autoconnect yes &>/dev/null || true
-        run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection up id "${connection_name}" ifname "${WIFI_INTERFACE}" &>/dev/null && return 0
+        if run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli connection up id "${connection_name}" ifname "${WIFI_INTERFACE}" &>/dev/null; then
+            apply_wifi_stationary_policy
+            return 0
+        fi
     fi
 
-    run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device connect "${WIFI_INTERFACE}" &>/dev/null
+    if run_with_timeout "${COMMAND_TIMEOUT_NMCLI}" nmcli device connect "${WIFI_INTERFACE}" &>/dev/null; then
+        apply_wifi_stationary_policy
+        return 0
+    fi
+
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -789,6 +894,13 @@ check_interface_connectivity() {
         fi
     fi
 
+    # Prefer configured application-level probes before public ICMP targets.
+    # This avoids forcing reconnects on networks where ping is flaky or deprioritized.
+    notify_watchdog
+    if probe_non_icmp_connectivity "${iface}"; then
+        return 0
+    fi
+
     # Try fallback targets
     for target in "${PING_TARGETS[@]}"; do
         notify_watchdog
@@ -796,12 +908,6 @@ check_interface_connectivity() {
             return 0
         fi
     done
-
-    # Optional fallback probes for networks that block ICMP.
-    notify_watchdog
-    if probe_non_icmp_connectivity "${iface}"; then
-        return 0
-    fi
 
     return 1
 }
@@ -1082,6 +1188,7 @@ ensure_wifi_up() {
     if ! try_nmcli_reconnect; then
         run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reconfigure &>/dev/null || true
         run_with_timeout "${COMMAND_TIMEOUT_WPA_CLI}" wpa_cli -i "${WIFI_INTERFACE}" reassociate &>/dev/null || true
+        apply_wifi_stationary_policy
     fi
 
     # Wait for association and request DHCP.

@@ -35,6 +35,15 @@ The script supports these key environment variables:
 - `CONNECTIVITY_HTTP_URL` (default: empty, optional non-ICMP probe)
 - `CONNECTIVITY_TCP_HOST` (default: empty, optional non-ICMP probe)
 - `CONNECTIVITY_TCP_PORT` (default: `443`)
+- `DISABLE_WIFI_STEERING` (default: `true`)
+- `DISABLE_WIFI_BGSCAN` (default: `true`)
+- `WIFI_BSSID` (default: empty, optional fixed AP BSSID)
+- `WIFI_BAND` (default: empty, optional NetworkManager band)
+- `WIFI_CHANNEL` (default: empty, optional NetworkManager channel)
+- `REASSOCIATE_AFTER` (default: `3`)
+- `IFUPDOWN_AFTER` (default: `5`)
+- `RFKILL_AFTER` (default: `8`)
+- `FULL_RESET_AFTER` (default: `12`)
 - `RECOVERY_ACTION_MIN_INTERVAL` (default: `45`)
 - `FULL_RESET_MIN_INTERVAL` (default: `180`)
 - `MAX_DISRUPTIVE_ACTIONS_PER_HOUR` (default: `12`)
@@ -50,9 +59,11 @@ The script supports these key environment variables:
 
 Set `WIFI_CONNECTION_NAME` when you want reconnect attempts to target a specific saved NM profile (for example enterprise WiFi like `asu`).
 
-If your network blocks ICMP, set at least one of `CONNECTIVITY_HTTP_URL` or `CONNECTIVITY_TCP_HOST` to reduce false recovery escalations.
+If your network blocks, delays, or deprioritizes ICMP, set at least one of `CONNECTIVITY_HTTP_URL` or `CONNECTIVITY_TCP_HOST` to reduce false recovery escalations. Configured HTTP/TCP probes are tried before public ping targets.
 
-By default, watchdog enforces WiFi power-save off (`wifi.powersave=2`) for NetworkManager and also applies `iw ... set power_save off` when available.
+By default, watchdog treats Pis as stationary WiFi clients: it disables WiFi power save, asks `wpa_supplicant` to suppress BSS transition steering when supported (`bss_transition=0` / `bss_tm_disabled=1`), disables background scanning (`bgscan ""`), and avoids `nmcli device reapply` because it can churn DHCP on active links.
+
+Optional `WIFI_BSSID`, `WIFI_BAND`, and `WIFI_CHANNEL` values can pin a deployment to a known AP or band, but they are empty by default so a normal push/install applies the safer steering policy without requiring systemd drop-ins.
 
 ## Runtime Safeguards
 
